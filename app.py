@@ -49,56 +49,93 @@ def get_contact_for_note(note_id: str) -> dict:
 def hubspot_webhook():
     try:
         payload = request.get_json(force=True)
+        print(f"Received payload: {payload}")
 
-        # HubSpot sends a list of subscription events
+        # HubSpot Workflows send a single dict with properties at the top level
+        # HubSpot Subscription webhooks send a list of event dicts
         if isinstance(payload, list):
+            # Legacy subscription-based webhook format
             events = payload
+            for event in events:
+                event_type = event.get("subscriptionType", "")
+
+                # Only process note/engagement events
+                if "note" not in event_type.lower() and "engagement" not in event_type.lower():
+                    continue
+
+                object_id = str(event.get("objectId", ""))
+                if not object_id:
+                    continue
+
+                # Fetch the note body from HubSpot
+                note_url = f"https://api.hubapi.com/crm/v3/objects/notes/{object_id}"
+                note_resp = requests.get(
+                    note_url,
+                    headers=HUBSPOT_HEADERS,
+                    params={"properties": "hs_note_body,hs_timestamp"}
+                )
+                note_resp.raise_for_status()
+                note_body = note_resp.json().get("properties", {}).get("hs_note_body", "") or ""
+
+                if TRIGGER_PHRASE not in note_body.lower():
+                    continue
+
+                print(f"Trigger found in note {object_id} — generating designer brief...")
+                contact_data = get_contact_for_note(object_id)
+                brief = extract_brief_from_notes(note_body, contact_data)
+                pdf_bytes = generate_brief_pdf(brief)
+                send_designer_brief(
+                    pdf_bytes,
+                    brief.get("client_names", contact_data.get("name", "Client")),
+                    brief.get("site_address", contact_data.get("address", ""))
+                )
+                print("Designer brief sent successfully.")
+
         else:
-            events = [payload]
-
-        for event in events:
-            event_type = event.get("subscriptionType", "")
-
-            # Only process new notes
-            if "note" not in event_type.lower() and "engagement" not in event_type.lower():
-                continue
-
-            object_id = str(event.get("objectId", ""))
-            if not object_id:
-                continue
-
-            # Fetch the note body from HubSpot
-            note_url = f"https://api.hubapi.com/crm/v3/objects/notes/{object_id}"
-            note_resp = requests.get(
-                note_url,
-                headers=HUBSPOT_HEADERS,
-                params={"properties": "hs_note_body,hs_timestamp"}
+            # HubSpot Workflow webhook format — single dict payload
+            # The note ID is sent directly as a top-level field
+            object_id = str(
+                payload.get("noteId")
+                or payload.get("objectId")
+                or payload.get("hs_object_id")
+                or ""
             )
-            note_resp.raise_for_status()
-            note_body = note_resp.json().get("properties", {}).get("hs_note_body", "") or ""
 
-            # Check for trigger phrase (case-insensitive)
+            # The note body may be included directly in the payload or must be fetched
+            note_body = (
+                payload.get("hs_note_body")
+                or payload.get("properties", {}).get("hs_note_body")
+                or ""
+            )
+
+            # If the note body wasn't in the payload, fetch it from HubSpot
+            if not note_body and object_id:
+                note_url = f"https://api.hubapi.com/crm/v3/objects/notes/{object_id}"
+                note_resp = requests.get(
+                    note_url,
+                    headers=HUBSPOT_HEADERS,
+                    params={"properties": "hs_note_body,hs_timestamp"}
+                )
+                note_resp.raise_for_status()
+                note_body = note_resp.json().get("properties", {}).get("hs_note_body", "") or ""
+
+            if not object_id:
+                print("No note ID found in Workflow payload — skipping.")
+                return jsonify({"status": "ok", "detail": "no note id"}), 200
+
             if TRIGGER_PHRASE not in note_body.lower():
-                continue
+                print(f"Trigger phrase not found in note {object_id} — skipping.")
+                return jsonify({"status": "ok", "detail": "trigger not found"}), 200
 
             print(f"Trigger found in note {object_id} — generating designer brief...")
-
-            # Get associated contact details
             contact_data = get_contact_for_note(object_id)
-
-            # Ask Claude to extract and structure the brief
             brief = extract_brief_from_notes(note_body, contact_data)
-
-            # Generate the PDF
             pdf_bytes = generate_brief_pdf(brief)
-
-            # Send the email to Matthew
             send_designer_brief(
                 pdf_bytes,
                 brief.get("client_names", contact_data.get("name", "Client")),
                 brief.get("site_address", contact_data.get("address", ""))
             )
-
             print("Designer brief sent successfully.")
 
         return jsonify({"status": "ok"}), 200
@@ -116,3 +153,4 @@ def health():
 if __name__ == "__main__":
     port = int(os.environ.get("PORT", 5000))
     app.run(host="0.0.0.0", port=port)
+
